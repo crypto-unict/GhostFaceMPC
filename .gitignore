@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+# Downloaded and generated inputs: model bundles, datasets, build trees.
+/artifacts
+/datasets
+/build
+# Measurements written by run_experiments.sh.
+/results
+third_party/*.tar.gz
+third_party/EzPC-porthos-cache.git/
+/paper

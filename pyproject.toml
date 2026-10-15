@@ -1,0 +1,56 @@
+[build-system]
+# >=77 for PEP 639: the `license = "MIT"` string form and `license-files`.
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ghostmpc"
+version = "1.0.0"
+description = "GhostFaceMPC: privacy-preserving face recognition with three-party MPC (MP-SPDZ)"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{name = "Davide Carnemolla", email = "cdavide98carnemolla@gmail.com"}]
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.26,<2.0"]
+
+[project.urls]
+Repository = "https://github.com/crypto-unict/ghostfacempc"
+
+[project.optional-dependencies]
+# TensorFlow loads the float teacher (accuracy, export, training, plaintext
+# baseline); Pillow decodes the aligned faces.
+export = ["tensorflow-cpu==2.15.1", "Pillow>=10"]
+# The EzPC/Porthos baseline: ONNX export and the Athos frontend.
+porthos = ["onnx>=1.15,<1.17", "onnxruntime>=1.17,<2", "onnxsim>=0.4.36,<0.5"]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[project.scripts]
+ghostmpc = "ghostmpc.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+extend-exclude = ["third_party", "build"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+# Drivers extend sys.path before importing the package.
+"baselines/*/*.py" = ["E402"]
+"tests/*.py" = ["E402"]
+# The historical naive emitter is kept as it was written.
+"baselines/naive-mpspdz/naive_ghostmpc/*.py" = ["E", "F", "W", "I", "UP"]
+# The generated C++ inside these templates keeps its own indentation.
+"baselines/porthos/prepare_build.py" = ["E101", "E402", "W191"]

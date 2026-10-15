@@ -1,0 +1,767 @@
+diff --git a/Compiler/instructions.py b/Compiler/instructions.py
+index cf56930a..2d3c43f3 100644
+--- a/Compiler/instructions.py
++++ b/Compiler/instructions.py
+@@ -1233,6 +1233,67 @@ class shrsi(base.ClearShiftInstruction):
+     code = base.opcodes['SHRSI']
+     arg_format = ['sw','s','i']
+ 
++@base.vectorize
++class shrsi2(base.ClearShiftInstruction):
++    """ Bitwise right shift of the *two-summand* regrouping of a replicated
++    secret register (vector) by a constant immediate value.
++
++    :class:`shrsi` shifts the three additive summands of a replicated sharing
++    separately, so a truncation identity built on it carries corrections in
++    ``{0,1,2}`` and pays two bit injections for each of them.  This
++    instruction shifts the two-summand regrouping instead -- the same one
++    ``split_to_n_summands(k, 2)`` produces -- so the corrections are single
++    bits.  The result is not a sharing of the right shift of the secret value
++    either: it still needs the two carries computed over the split columns.
++
++    Only replicated three-party rings implement it.  It sends one ring element
++    from player 0 to player 1 and opens nothing.
++
++    :param: result (sint)
++    :param: first operand (sint)
++    :param: second operand (int)
++
++    """
++    __slots__ = []
++    code = base.opcodes['SHRSI2']
++    arg_format = ['sw','s','i']
++
++class prefetchdabit(base.Instruction):
++    """ Generate, now, the daBits of one iteration of a loop.
++
++    The virtual machine reads the daBit usage the compiler recorded for the
++    whole tape, divides it by the iteration count, and fills its daBit buffer
++    up to that many before returning.  A loop that calls this at the top of
++    each of its ``iterations`` identical iterations, and that contains every
++    daBit the tape consumes, therefore never refills its buffer inside the
++    iteration: the generation, and its rounds, happen here.  The buffer is the
++    calling thread's.
++
++    :param: iterations (int)
++
++    """
++    __slots__ = []
++    code = base.opcodes['PREFETCHDABIT']
++    arg_format = ['i']
++
++class prefetchprep(base.Instruction):
++    """ Generate, now, all the preprocessing of one iteration of a loop.
++
++    The actively secure counterpart of :class:`prefetchdabit`: the virtual
++    machine divides the tape's compiled usage by the iteration count and fills
++    every buffer one iteration draws on -- the edaBits of each width, the
++    random bits a daBit is drawn from, and the binary triples of the AND gates
++    -- before returning, then settles the checks the generation left pending.
++    Each count carries a small slack, which the next iteration consumes.  The
++    buffers are the calling thread's.
++
++    :param: iterations (int)
++
++    """
++    __slots__ = []
++    code = base.opcodes['PREFETCHPREP']
++    arg_format = ['i']
++
+ ###
+ ### Data access instructions
+ ###
+diff --git a/Compiler/instructions_base.py b/Compiler/instructions_base.py
+index 5f6b8258..f2d90bb2 100644
+--- a/Compiler/instructions_base.py
++++ b/Compiler/instructions_base.py
+@@ -206,6 +206,9 @@ opcodes = dict(
+     PRINTCHR = 0xB4,
+     PRINTSTR = 0xB5,
+     PUBINPUT = 0xB6,
++    SHRSI2 = 0xF8,
++    PREFETCHDABIT = 0xF9,
++    PREFETCHPREP = 0xFF,
+     RAWOUTPUT = 0xB7,
+     STARTPRIVATEOUTPUT = 0xB8,
+     STOPPRIVATEOUTPUT = 0xB9,
+diff --git a/Processor/BaseMachine.cpp b/Processor/BaseMachine.cpp
+index 2efa619a..da69b046 100644
+--- a/Processor/BaseMachine.cpp
++++ b/Processor/BaseMachine.cpp
+@@ -221,12 +221,18 @@ void BaseMachine::start(int n)
+   cout << "Starting timer " << n << " at " << timer[n].elapsed()
+     << " (" << timer[n] << ")"
+     << " after " << timer[n].idle() << endl;
++  timer_start_snapshot[n] = timer[n];
++  prep_start_snapshot[n] = total_prep_time();
+   timer[n].start(total_stats());
+ }
+ 
+ void BaseMachine::stop(int n)
+ {
+   timer[n].stop(total_stats());
++  auto total = timer[n] - timer_start_snapshot[n];
++  auto offline = total_prep_time() - prep_start_snapshot[n];
++  offline_timer[n] += offline;
++  online_timer[n] += total - offline;
+   cout << "Stopped timer " << n << " at " << timer[n].elapsed() << " ("
+       << timer[n] << ")" << endl;
+ }
+@@ -245,6 +251,18 @@ void BaseMachine::print_timers()
+       {
+         cerr << "Time" << it->first << " = " << it->second.elapsed()
+             << " seconds (" << it->second << ")" << endl;
++        cerr << "Time" << it->first << "[bytes] = "
++            << it->second.bytes_sent() << endl;
++        cerr << "Time" << it->first << "[online] = "
++            << online_timer[it->first].elapsed() << " seconds ("
++            << online_timer[it->first] << ")" << endl;
++        cerr << "Time" << it->first << "[online][bytes] = "
++            << online_timer[it->first].bytes_sent() << endl;
++        cerr << "Time" << it->first << "[offline] = "
++            << offline_timer[it->first].elapsed() << " seconds ("
++            << offline_timer[it->first] << ")" << endl;
++        cerr << "Time" << it->first << "[offline][bytes] = "
++            << offline_timer[it->first].bytes_sent() << endl;
+         if (not it->second.exe_stats().empty()
+             and OnlineOptions::singleton.has_option("part_exe"))
+           it->second.exe_stats().print();
+@@ -333,6 +351,11 @@ ThreadStats BaseMachine::total_stats()
+   return queues.total_stats();
+ }
+ 
++TimerWithComm BaseMachine::total_prep_time()
++{
++  return queues.total_prep_time();
++}
++
+ void BaseMachine::set_thread_stats(const ThreadStats& stats)
+ {
+   auto queue = queues.at(BaseMachine::thread_num);
+@@ -340,6 +363,13 @@ void BaseMachine::set_thread_stats(const ThreadStats& stats)
+   queue->set_stats(stats);
+ }
+ 
++void BaseMachine::set_thread_prep_time(const TimerWithComm& prep)
++{
++  auto queue = queues.at(BaseMachine::thread_num);
++  assert(queue);
++  queue->set_prep_snapshot(prep);
++}
++
+ void BaseMachine::print_global_comm(Player& P, const NamedCommStats& stats)
+ {
+   Bundle<octetStream> bundle(P);
+diff --git a/Processor/BaseMachine.h b/Processor/BaseMachine.h
+index 68ebdbb7..1bb739e2 100644
+--- a/Processor/BaseMachine.h
++++ b/Processor/BaseMachine.h
+@@ -33,6 +33,10 @@ protected:
+     static thread_local const Program* program;
+ 
+     std::map<int,TimerWithComm> timer;
++    std::map<int,TimerWithComm> timer_start_snapshot;
++    std::map<int,TimerWithComm> prep_start_snapshot;
++    std::map<int,TimerWithComm> online_timer;
++    std::map<int,TimerWithComm> offline_timer;
+ 
+     string compiler;
+     string domain;
+@@ -49,9 +53,9 @@ protected:
+ 
+     static BaseMachine get_basics(string progname);
+ 
++public:
+     static DataPositions get_offline_data_used();
+ 
+-public:
+     static thread_local int thread_num;
+ 
+     string progname;
+@@ -117,7 +121,9 @@ public:
+     static OTTripleSetup fresh_ot_setup(Player& P);
+ 
+     ThreadStats total_stats();
++    TimerWithComm total_prep_time();
+     void set_thread_stats(const ThreadStats& stats);
++    void set_thread_prep_time(const TimerWithComm& prep);
+ 
+     void print_global_comm(Player& P, const NamedCommStats& stats);
+     void print_comm(Player& P, const NamedCommStats& stats);
+diff --git a/Processor/Data_Files.h b/Processor/Data_Files.h
+index 716f0145..7d631a51 100644
+--- a/Processor/Data_Files.h
++++ b/Processor/Data_Files.h
+@@ -194,6 +194,17 @@ public:
+   /// Store fresh daBit in ``a`` (arithmetic part) and ``b`` (binary part)
+   virtual void get_dabit(T& a, typename T::bit_type& b);
+   virtual void get_dabit_no_count(T&, typename T::bit_type&) { throw runtime_error("no daBit"); }
++  /// Generate daBits now until at least ``n`` are buffered
++  virtual void prefetch_dabits(size_t) { throw runtime_error("no daBit prefetch"); }
++  /// Generate random bits now until at least ``n`` are buffered
++  virtual void prefetch_bits(size_t) { throw runtime_error("no bit prefetch"); }
++  /// Generate triples now until at least ``n`` buffer entries are held
++  virtual void prefetch_triples(size_t) { throw runtime_error("no triple prefetch"); }
++  /// Generate edaBits now until each (strict, width) holds its count
++  virtual void prefetch_edabits(const map<pair<bool, int>, long long>&)
++  { throw runtime_error("no edaBit prefetch"); }
++  /// Settle any check the generation left pending
++  virtual void finish_prefetch() {}
+   virtual void get_edabits(bool strict, size_t size, T* a,
+           StackedVector<typename T::bit_type>& Sb, const ArgVector& regs)
+   { get_edabits<0>(strict, size, a, Sb, regs, T::clear::characteristic_two); }
+diff --git a/Processor/Instruction.h b/Processor/Instruction.h
+index 75e483c5..35823547 100644
+--- a/Processor/Instruction.h
++++ b/Processor/Instruction.h
+@@ -207,6 +207,9 @@ enum
+     PRINTCHR = 0xB4,
+     PRINTSTR = 0xB5,
+     PUBINPUT = 0xB6,
++    SHRSI2 = 0xF8,
++    PREFETCHDABIT = 0xF9,
++    PREFETCHPREP = 0xFF,
+     RAWOUTPUT = 0xB7,
+     STARTPRIVATEOUTPUT = 0xB8,
+     STOPPRIVATEOUTPUT = 0xB9,
+@@ -431,4 +434,3 @@ public:
+ };
+ 
+ #endif
+-
+diff --git a/Processor/Instruction.hpp b/Processor/Instruction.hpp
+index f5ef393b..d2599bb5 100644
+--- a/Processor/Instruction.hpp
++++ b/Processor/Instruction.hpp
+@@ -188,6 +188,7 @@ void BaseInstruction::parse_operands(istream& s, int pos, int file_pos)
+       case SHLCI:
+       case SHRCI:
+       case SHRSI:
++      case SHRSI2:
+       case SHLCBI:
+       case SHRCBI:
+       case NOTC:
+@@ -279,6 +280,8 @@ void BaseInstruction::parse_operands(istream& s, int pos, int file_pos)
+       case START:
+       case STOP:
+       case PRINTFLOATPREC:
++      case PREFETCHDABIT:
++      case PREFETCHPREP:
+         n = get_int(s);
+         break;
+       // instructions with no operand
+@@ -965,6 +968,12 @@ inline void Instruction::execute(Processor<sint, sgf2n>& Proc) const
+   // optimize some instructions
+   switch (opcode)
+   {
++    case PREFETCHDABIT:
++      Proc.prefetch_dabits(n);
++      return;
++    case PREFETCHPREP:
++      Proc.prefetch_prep(n);
++      return;
+     case CONVMODP:
+       vector<Integer> values;
+       values.reserve(size);
+@@ -1159,6 +1168,9 @@ inline void Instruction::execute(Processor<sint, sgf2n>& Proc) const
+       case SHRSI:
+         sint::shrsi(Procp, *this);
+         return;
++      case SHRSI2:
++        sint::shrsi2(Procp, *this);
++        return;
+       case GSHRSI:
+         sgf2n::shrsi(Proc2, *this);
+         return;
+@@ -1299,10 +1311,12 @@ inline void Instruction::execute(Processor<sint, sgf2n>& Proc) const
+ 	break;
+       case START:
+         Proc.machine.set_thread_stats({Proc.P.total_comm(), Proc.stats});
++        Proc.machine.set_thread_prep_time(Proc.prep_time());
+         Proc.machine.start(n);
+         break;
+       case STOP:
+         Proc.machine.set_thread_stats({Proc.P.total_comm(), Proc.stats});
++        Proc.machine.set_thread_prep_time(Proc.prep_time());
+         Proc.machine.stop(n);
+         break;
+       case RUN_TAPE:
+diff --git a/Processor/Online-Thread.hpp b/Processor/Online-Thread.hpp
+index 3a5151ae..b525ae4a 100644
+--- a/Processor/Online-Thread.hpp
++++ b/Processor/Online-Thread.hpp
+@@ -306,6 +306,7 @@ void thread_info<sint, sgf2n>::Sub_Main_Func()
+               "in thread %d\n", program, num);
+ #endif
+           queues->stop_online(P, Proc.prep_time());
++          queues->set_prep_snapshot(Proc.prep_time());
+           queues->finished(job, {P.total_comm(), Proc.stats});
+        }  
+       else
+diff --git a/Processor/Processor.h b/Processor/Processor.h
+index 7171ddc2..d253528f 100644
+--- a/Processor/Processor.h
++++ b/Processor/Processor.h
+@@ -244,6 +244,8 @@ class Processor : public ArithmeticProcessor
+ 
+   void reset(const Program& program,int arg); // Reset the state of the processor
+   string get_filename(const char* basename, bool use_number);
++  void prefetch_dabits(int iterations);
++  void prefetch_prep(int iterations);
+ 
+   Processor(int thread_num,Player& P,
+           typename sgf2n::MAC_Check& MC2,typename sint::MAC_Check& MCp,
+@@ -320,4 +322,3 @@ class Processor : public ArithmeticProcessor
+ };
+ 
+ #endif
+-
+diff --git a/Processor/Processor.hpp b/Processor/Processor.hpp
+index 55fd8d06..262264c0 100644
+--- a/Processor/Processor.hpp
++++ b/Processor/Processor.hpp
+@@ -78,6 +78,84 @@ inline ofstream& Processor<sint, sgf2n>::get_binary_output()
+   return binary_output;
+ }
+ 
++// One iteration's worth of daBits, read from the tape's compiled usage: the
++// program calls this once per iteration of a loop that runs ``iterations``
++// identical times and contains every daBit the tape consumes.
++template<class sint, class sgf2n>
++void Processor<sint, sgf2n>::prefetch_dabits(int iterations)
++{
++  if (iterations <= 0)
++    throw Processor_Error("prefetchdabit needs a positive iteration count");
++  auto usage = BaseMachine::get_offline_data_used();
++  auto field = sint::clear::field_type();
++  long long total = usage.files[field][DATA_DABIT];
++  long long bits = usage.files[field][DATA_BIT];
++  if (total < 0 or bits < 0)
++    throw Processor_Error("prefetchdabit: daBit usage of the tape is unknown");
++  if (sint::LivePrep::bits_from_dabits())
++    total += bits;
++  if (total % iterations != 0)
++    throw Processor_Error("prefetchdabit: daBit usage " + to_string(total)
++        + " is not a multiple of " + to_string(iterations) + " iterations");
++  Procp.DataF.prefetch_dabits(total / iterations);
++}
++
++// Every buffer one iteration draws on, for an actively secure live
++// preprocessing: the edaBits of each width, the arithmetic random
++// bits a daBit is drawn from where the protocol makes daBits from bits, and
++// the binary triples of the AND gates.  The order is the dependency order --
++// strict edaBits consume bits and binary triples while they are generated --
++// and every count carries slack, because a vector of n bits consumes whole
++// 64-bit words and the leftover simply serves the next iteration.
++template<class sint, class sgf2n>
++void Processor<sint, sgf2n>::prefetch_prep(int iterations)
++{
++  if (iterations <= 0)
++    throw Processor_Error("prefetchprep needs a positive iteration count");
++  auto usage = BaseMachine::get_offline_data_used();
++  auto share = [&](long long total, const string& what)
++  {
++    if (total < 0)
++      throw Processor_Error("prefetchprep: " + what + " usage is unknown");
++    return size_t(DIV_CEIL(total, iterations));
++  };
++  auto slack = [](size_t n) { return n ? n + n / 20 + 1024 : 0; };
++
++  map<pair<bool, int>, long long> edabits;
++  for (auto& x : usage.edabits)
++    if (x.second)
++      edabits[x.first] = slack(share(x.second, "edaBit"));
++  if (not edabits.empty())
++    Procp.DataF.prefetch_edabits(edabits);
++
++  auto field = sint::clear::field_type();
++  size_t dabits = share(usage.files[field][DATA_DABIT], "daBit");
++  size_t bits = share(usage.files[field][DATA_BIT], "bit");
++  if (sint::LivePrep::dabits_from_bits())
++  {
++    if (dabits + bits)
++      Procp.DataF.prefetch_bits(slack(dabits + bits));
++  }
++  else if (sint::LivePrep::bits_from_dabits())
++  {
++    if (dabits + bits)
++      Procp.DataF.prefetch_dabits(slack(dabits + bits));
++  }
++  else
++  {
++    if (dabits)
++      Procp.DataF.prefetch_dabits(slack(dabits));
++    if (bits)
++      Procp.DataF.prefetch_bits(slack(bits));
++  }
++
++  size_t and_bits = share(usage.files[DATA_GF2][DATA_TRIPLE], "binary triple");
++  if (and_bits)
++    DataF.DataFb.prefetch_triples(slack(DIV_CEIL(and_bits, 64)));
++
++  Procp.DataF.finish_prefetch();
++}
++
+ template<class sint, class sgf2n>
+ Processor<sint, sgf2n>::Processor(int thread_num,Player& P,
+         typename sgf2n::MAC_Check& MC2,typename sint::MAC_Check& MCp,
+diff --git a/Processor/ThreadQueue.cpp b/Processor/ThreadQueue.cpp
+index 25a43847..89abad2b 100644
+--- a/Processor/ThreadQueue.cpp
++++ b/Processor/ThreadQueue.cpp
+@@ -98,6 +98,21 @@ ThreadStats ThreadQueue::get_stats()
+     return res;
+ }
+ 
++void ThreadQueue::set_prep_snapshot(const TimerWithComm& prep)
++{
++    lock.lock();
++    prep_snapshot = prep;
++    lock.unlock();
++}
++
++TimerWithComm ThreadQueue::get_prep_snapshot()
++{
++    lock.lock();
++    auto res = prep_snapshot;
++    lock.unlock();
++    return res;
++}
++
+ void ThreadQueue::start_timer()
+ {
+     debug = OnlineOptions::singleton.has_option("debug_timers");
+diff --git a/Processor/ThreadQueue.h b/Processor/ThreadQueue.h
+index c473d0b1..6aceb29f 100644
+--- a/Processor/ThreadQueue.h
++++ b/Processor/ThreadQueue.h
+@@ -16,6 +16,7 @@ class ThreadQueue
+     Lock lock;
+     int left;
+     ThreadStats thread_stats;
++    TimerWithComm prep_snapshot;
+     TimerWithComm timer, online_timer, online_prep_timer;
+     Timer inside_wait_timer;
+     bool debug;
+@@ -48,6 +49,8 @@ public:
+ 
+     void set_stats(const ThreadStats& new_stats);
+     ThreadStats get_stats();
++    void set_prep_snapshot(const TimerWithComm& prep);
++    TimerWithComm get_prep_snapshot();
+ 
+     void start_timer();
+     void stop_timer(Player& P);
+diff --git a/Processor/ThreadQueues.cpp b/Processor/ThreadQueues.cpp
+index 239d731c..6fcedd61 100644
+--- a/Processor/ThreadQueues.cpp
++++ b/Processor/ThreadQueues.cpp
+@@ -202,6 +202,14 @@ ThreadStats ThreadQueues::total_stats()
+     return res;
+ }
+ 
++TimerWithComm ThreadQueues::total_prep_time()
++{
++    TimerWithComm res;
++    for (auto& queue : *this)
++        res += queue->get_prep_snapshot();
++    return res;
++}
++
+ NamedCommStats ThreadQueues::max_comm()
+ {
+     NamedCommStats max;
+diff --git a/Processor/ThreadQueues.h b/Processor/ThreadQueues.h
+index 1b24b082..0d825c8c 100644
+--- a/Processor/ThreadQueues.h
++++ b/Processor/ThreadQueues.h
+@@ -41,6 +41,7 @@ public:
+     void print_breakdown();
+ 
+     ThreadStats total_stats();
++    TimerWithComm total_prep_time();
+     NamedCommStats max_comm();
+ };
+ 
+diff --git a/Processor/instructions.h b/Processor/instructions.h
+index 6ce6c148..cab34074 100644
+--- a/Processor/instructions.h
++++ b/Processor/instructions.h
+@@ -366,6 +366,9 @@
+     X(WRITEFILESHARE, throw not_implemented(),) \
+     X(READFILESHARE, throw not_implemented(),) \
+     X(PUBINPUT, throw not_implemented(),) \
++    X(SHRSI2, throw not_implemented(),) \
++    X(PREFETCHDABIT, throw not_implemented(),) \
++    X(PREFETCHPREP, throw not_implemented(),) \
+     X(RAWOUTPUT, throw not_implemented(),) \
+     X(INTOUTPUT, throw not_implemented(),) \
+     X(FLOATOUTPUT, throw not_implemented(),) \
+diff --git a/Protocols/Rep3Share.h b/Protocols/Rep3Share.h
+index c106be7d..87e2228a 100644
+--- a/Protocols/Rep3Share.h
++++ b/Protocols/Rep3Share.h
+@@ -111,6 +111,104 @@ public:
+             dest = source >> inst.get_n();
+         }
+     }
++
++    template<class U>
++    static void shrsi2(SubProcessor<U>& proc, const Instruction& inst)
++    {
++        shrsi2(proc, inst, T::prime_field);
++    }
++
++    template<class U>
++    static void shrsi2(SubProcessor<U>&, const Instruction&,
++            true_type)
++    {
++        throw runtime_error("shrsi2 not implemented");
++    }
++
++    // Local right shift of the *two-summand* regrouping of a replicated
++    // sharing (ghostmpc).
++    //
++    // ``shrsi`` shifts the three additive summands separately, which is why
++    // the truncation identity built on it needs carries in {0,1,2} and hence
++    // four bit injections.  Party i holds (x_i, x_{i-1}), so P0 -- and only
++    // P0 -- knows A = x_0 + x_2, while B = x_1 is held by both P1 (index 0)
++    // and P2 (index 1).  That is exactly the decomposition
++    // ``split_to_n_summands(k, 2)`` uses, so the single-bit carries computed
++    // over its columns correct exactly this shift.
++    //
++    // The shifted summands are re-shared as (t_A - rho, t_B, rho) with rho
++    // drawn from the PRNG P0 shares with P2, so only ``t_A - rho`` travels,
++    // from P0 to P1: one ring element in one round.  P1 does not hold that
++    // PRNG, so its view is uniform; nothing is opened and no party learns a
++    // value it did not already hold.
++    //
++    // The re-shared summand has a single holder, which is why this is a
++    // semi-honest primitive: a corrupt P0 could send a different value from
++    // the one it keeps and no party could contradict it.  Actively secure
++    // replicated protocols use a different protocol object, without the shared
++    // PRNGs, so the body below is only instantiated where it is meaningful and
++    // every other share type gets the same runtime refusal as an unsupported
++    // instruction.
++    template<class U>
++    static void shrsi2(SubProcessor<U>& proc, const Instruction& inst,
++            false_type)
++    {
++        if constexpr (not requires { proc.protocol.shared_prngs; })
++        {
++            (void) inst;
++            throw runtime_error(
++                    "shrsi2 is only available to a protocol with the "
++                    "replicated shared PRNGs");
++        }
++        else
++        {
++        auto& P = proc.P;
++        auto& prngs = proc.protocol.shared_prngs;
++        const int shift = inst.get_n();
++        const int size = inst.get_size();
++        octetStream os;
++        switch (P.my_num())
++        {
++        case 0:
++            for (int i = 0; i < size; i++)
++            {
++                auto source = proc.get_S_ref(inst.get_r(1) + i);
++                T rho;
++                rho.randomize(prngs[1]);
++                T masked = ((source[0] + source[1]) >> shift) - rho;
++                masked.pack(os);
++                auto& dest = proc.get_S_ref(inst.get_r(0) + i);
++                dest[0] = masked;
++                dest[1] = rho;
++            }
++            P.send_to(1, os);
++            break;
++        case 1:
++            P.receive_player(0, os);
++            for (int i = 0; i < size; i++)
++            {
++                auto source = proc.get_S_ref(inst.get_r(1) + i);
++                T masked;
++                masked.unpack(os);
++                auto& dest = proc.get_S_ref(inst.get_r(0) + i);
++                dest[0] = source[0] >> shift;
++                dest[1] = masked;
++            }
++            break;
++        case 2:
++            for (int i = 0; i < size; i++)
++            {
++                auto source = proc.get_S_ref(inst.get_r(1) + i);
++                T rho;
++                rho.randomize(prngs[0]);
++                auto& dest = proc.get_S_ref(inst.get_r(0) + i);
++                dest[0] = rho;
++                dest[1] = source[1] >> shift;
++            }
++            break;
++        }
++        }
++    }
+ };
+ 
+ template<class T>
+diff --git a/Protocols/ReplicatedPrep.h b/Protocols/ReplicatedPrep.h
+index 5a5cab02..405a44fb 100644
+--- a/Protocols/ReplicatedPrep.h
++++ b/Protocols/ReplicatedPrep.h
+@@ -130,6 +130,10 @@ public:
+             int vector_size);
+ 
+     virtual void get_dabit_no_count(T& a, typename T::bit_type& b);
++    virtual void prefetch_dabits(size_t n);
++    virtual void prefetch_bits(size_t n);
++    virtual void prefetch_triples(size_t n);
++    virtual void prefetch_edabits(const map<pair<bool, int>, long long>& need);
+ 
+     edabitvec<T> get_edabitvec(bool strict, int n_bits);
+     void get_edabit_no_count(bool strict, int n_bits, edabit<T>& eb);
+@@ -178,6 +182,15 @@ public:
+ 
+     /// Generate random bits from inputs without semi-honest security
+     void buffer_bits_without_check();
++
++    /// The bit generation records multiplications in ``protocol`` that are
++    /// checked only at its next batch or at destruction; a prefetch settles
++    /// them before the computation that consumes the bits starts.
++    void finish_prefetch()
++    {
++        if (protocol)
++            protocol->check();
++    }
+ };
+ 
+ /**
+diff --git a/Protocols/ReplicatedPrep.hpp b/Protocols/ReplicatedPrep.hpp
+index 70612131..979bcde5 100644
+--- a/Protocols/ReplicatedPrep.hpp
++++ b/Protocols/ReplicatedPrep.hpp
+@@ -1254,6 +1254,88 @@ void BufferPrep<T>::get_dabit_no_count(T& a, typename T::bit_type& b)
+     dabits.pop_back();
+ }
+ 
++// Fill the daBit buffer ahead of the computation that consumes it, so that
++// no refill (and none of its rounds) runs inside the online phase.  Each
++// refill generates exactly the deficit, capped to bound the memory a single
++// batch needs; the work is accounted to the preprocessing timer like any
++// lazy refill, so a surrounding timer reports it as offline.
++template<class T>
++void BufferPrep<T>::prefetch_dabits(size_t n)
++{
++    const size_t chunk = size_t(1) << 21;
++    InScope in_scope(this->do_count, false, *this);
++    int old_buffer_size = this->buffer_size;
++    while (dabits.size() < n)
++    {
++        this->buffer_size = int(min(chunk, n - dabits.size()));
++        buffer_dabits(0);
++    }
++    this->buffer_size = old_buffer_size;
++    if (OnlineOptions::singleton.has_option("verbose_dabit"))
++        fprintf(stderr, "prefetched daBits: %zu buffered for %zu\n",
++                dabits.size(), n);
++}
++
++// The same ahead-of-time filling for the other buffers a request can draw on
++// as well.  Random bits append per refill, so the deficit is requested
++// directly.  Triples do not: a refill of the shuffle-and-sacrifice generators
++// *replaces* the buffer, so the held ones are set aside and put back.
++template<class T>
++void BufferPrep<T>::prefetch_bits(size_t n)
++{
++    const size_t chunk = size_t(1) << 21;
++    InScope in_scope(this->do_count, false, *this);
++    int old_buffer_size = this->buffer_size;
++    while (bits.size() < n)
++    {
++        this->buffer_size = int(min(chunk, n - bits.size()));
++        buffer_bits();
++    }
++    this->buffer_size = old_buffer_size;
++    if (OnlineOptions::singleton.has_option("verbose_dabit"))
++        fprintf(stderr, "prefetched bits: %zu buffered for %zu\n",
++                bits.size(), n);
++}
++
++template<class T>
++void BufferPrep<T>::prefetch_triples(size_t n)
++{
++    InScope in_scope(this->do_count, false, *this);
++    while (triples.size() < n)
++    {
++        auto held = std::move(triples);
++        triples.clear();
++        buffer_triples();
++        triples.insert(triples.end(), held.begin(), held.end());
++    }
++    if (OnlineOptions::singleton.has_option("verbose_dabit"))
++        fprintf(stderr, "prefetched triples: %zu buffered for %zu\n",
++                triples.size(), n);
++}
++
++template<class T>
++void BufferPrep<T>::prefetch_edabits(const map<pair<bool, int>, long long>& need)
++{
++    InScope in_scope(this->do_count, false, *this);
++    for (auto& required : need)
++    {
++        auto held = [&]()
++        {
++            size_t count = my_edabits[required.first].size();
++            for (auto& x : edabits[required.first])
++                count += x.size();
++            return count;
++        };
++        while (held() < size_t(required.second))
++            buffer_edabits_with_queues(required.first.first,
++                    required.first.second);
++        if (OnlineOptions::singleton.has_option("verbose_dabit"))
++            fprintf(stderr, "prefetched %s edaBits of %d bits: %zu for %lld\n",
++                    required.first.first ? "strict" : "loose",
++                    required.first.second, held(), required.second);
++    }
++}
++
+ template<class T>
+ void BufferPrep<T>::get_personal_dabit(int player, T& a, typename T::bit_type& b)
+ {
+diff --git a/Protocols/ShareInterface.h b/Protocols/ShareInterface.h
+index 11d7b757..1c8563ed 100644
+--- a/Protocols/ShareInterface.h
++++ b/Protocols/ShareInterface.h
+@@ -80,6 +80,10 @@ public:
+     static void shrsi(T&, const Instruction&)
+     { throw runtime_error("shrsi not implemented"); }
+ 
++    template<class T>
++    static void shrsi2(T&, const Instruction&)
++    { throw runtime_error("shrsi2 not implemented"); }
++
+     static bool get_rec_factor(int, int) { return false; }
+ 
+     template<class T>
+diff --git a/Tools/TimerWithComm.cpp b/Tools/TimerWithComm.cpp
+index a774516d..50b43662 100644
+--- a/Tools/TimerWithComm.cpp
++++ b/Tools/TimerWithComm.cpp
+@@ -59,6 +59,7 @@ TimerWithComm TimerWithComm::operator -(const TimerWithComm& other)
+     TimerWithComm res = *this;
+     res.Timer::operator-=(other);
+     res.total_stats = total_stats - other.total_stats;
++    res.cpu_timer -= other.cpu_timer;
+     return res;
+ }
+ 
+@@ -66,6 +67,7 @@ TimerWithComm& TimerWithComm::operator +=(const TimerWithComm& other)
+ {
+     Timer::operator+=(other);
+     total_stats += other.total_stats;
++    cpu_timer += other.cpu_timer;
+     return *this;
+ }
+ 

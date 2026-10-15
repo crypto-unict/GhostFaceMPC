@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# Run a command with the three MPC parties on an emulated network.
+#
+#   scripts/netsim/ghostmpc-netsim <profile> -- <command> [args...]
+#
+# The topology is built by iproute2 from the argv sequence that
+# ghostmpc.benchmark.network emits, so this script holds no knowledge of the
+# network beyond running the lines it is handed and telling the harness where
+# they landed.
+#
+# No root is required. `unshare -Urnm` gives this process CAP_NET_ADMIN inside
+# a private user, network and mount namespace, which is enough for `ip netns`,
+# veth pairs and `tc`. The namespaces are anonymous and die with the process,
+# so there is no teardown step and nothing survives on the host.
+set -euo pipefail
+
+# tc and ip live in /sbin, which is absent from a non-root PATH on Debian.
+export PATH="/usr/sbin:/sbin:${PATH}"
+
+usage() {
+    echo "usage: $0 <profile> -- <command> [args...]" >&2
+    echo "       profiles: co-host, lan, fast-wan, wan" >&2
+    echo "       (lan: 0.1 ms / 1 Gbit/s, fast-wan: 10 ms / 1 Gbit/s," >&2
+    echo "        wan: 100 ms / 100 Mbit/s; co-host applies no shaping)" >&2
+    exit 2
+}
+
+[ $# -ge 3 ] || usage
+PROFILE="$1"; shift
+[ "$1" = "--" ] || usage
+shift
+
+REPOSITORY="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+PYTHON="${GHOSTMPC_PYTHON:-${REPOSITORY}/.venv/bin/python}"
+[ -x "${PYTHON}" ] || PYTHON="$(command -v python3)"
+
+# Fail on an unknown profile out here, where the error is readable, rather than
+# after the namespace has been entered.
+emit() {
+    (cd "${REPOSITORY}" && "${PYTHON}" -c "
+import sys
+from ghostmpc.benchmark import network
+sys.exit(network.emit(sys.argv[1:]))" "$@")
+}
+TOPOLOGY="$(emit topology "${PROFILE}")"
+HOSTS_CONTENT="$(emit hosts)"
+
+export GHOSTMPC_NETSIM_PROFILE="${PROFILE}"
+export GHOSTMPC_NETSIM_TOPOLOGY="${TOPOLOGY}"
+export GHOSTMPC_NETSIM_HOSTS_CONTENT="${HOSTS_CONTENT}"
+
+exec unshare -Urnm --propagation private "${BASH:-/bin/bash}" -s -- "$@" <<'INNER'
+set -euo pipefail
+export PATH="/usr/sbin:/sbin:${PATH}"
+
+# `ip netns add` bind-mounts the namespace under /run/netns. Inside the user
+# namespace the real /run belongs to an unmapped uid and is not writable, so
+# give this mount namespace its own empty /run. The host's /run is untouched.
+mount -t tmpfs none /run
+mkdir -p /run/netns
+
+while IFS= read -r command; do
+    [ -n "${command}" ] || continue
+    # shellcheck disable=SC2086 -- the emitter controls the word splitting.
+    eval ${command}
+done <<< "${GHOSTMPC_NETSIM_TOPOLOGY}"
+
+GHOSTMPC_NETSIM_HOSTS="$(mktemp /run/ghostmpc-hosts.XXXXXX)"
+printf '%s' "${GHOSTMPC_NETSIM_HOSTS_CONTENT}" > "${GHOSTMPC_NETSIM_HOSTS}"
+export GHOSTMPC_NETSIM_HOSTS
+unset GHOSTMPC_NETSIM_TOPOLOGY GHOSTMPC_NETSIM_HOSTS_CONTENT
+
+exec "$@"
+INNER
