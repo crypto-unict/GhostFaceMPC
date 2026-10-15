@@ -2,7 +2,8 @@
 
 Official implementation of *GhostFaceMPC: Privacy-Preserving Face Recognition
 with Multi-Party Computation* (Davide Carnemolla, Dario Catalano, Mario Di
-Raimondo — University of Catania). Paper: *ePrint link coming soon*.
+Raimondo — University of Catania). Paper:
+[Cryptology ePrint Archive, Paper 2026/2499](https://eprint.iacr.org/2026/2499).
 
 GhostFaceMPC runs face recognition with **GhostFaceNetV1** (width 1.3,
 stride 1, ArcFace head, trained on MS1MV3) among three servers with
@@ -28,11 +29,12 @@ This repository contains exactly the code needed to reproduce the experiments
 of the paper.
 
 ```bibtex
-@misc{ghostfacempc,
-  title  = {{GhostFaceMPC}: Privacy-Preserving Face Recognition with Multi-Party Computation},
-  author = {Carnemolla, Davide and Catalano, Dario and Di Raimondo, Mario},
-  note   = {Cryptology ePrint Archive, to appear},
-  year   = {2026}
+@misc{cryptoeprint:2026/2499,
+      author = {Davide Carnemolla and Dario Catalano and Mario Di Raimondo},
+      title = {{GhostFaceMPC}: Privacy-Preserving Face Recognition with Multi-Party Computation},
+      howpublished = {Cryptology {ePrint} Archive, Paper 2026/2499},
+      year = {2026},
+      url = {https://eprint.iacr.org/2026/2499}
 }
 ```
 
